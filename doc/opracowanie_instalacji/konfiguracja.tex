@@ -1,0 +1,416 @@
+\documentclass[12pt]{article}
+\usepackage[polish]{babel}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[a4paper, left=2.5cm, top=3.5cm, bottom=3.5cm, headsep=1.2cm]{geometry}
+%\usepackage[colorlinks=true,linkcolor=blue,urlcolor=blue]{hyperref}
+\setlength{\textwidth}{15cm}
+\setlength{\parskip}{2ex}
+\hyphenation{IaaS Rack-Space}
+
+\title{Konfiguracja Swifta w laboratorium 518}
+\author{Szymon Piątek}
+
+\begin{document}
+\maketitle
+\begin{center}
+\textbf{Na podstawie http://swift.openstack.org/howto\_installmultinode.html}
+\end{center}
+
+\section{Swift}
+
+Swift jest jedną z trzech głównych części projektu OpenStack. Pozostałe dwie to Nova i Glance. Na Swift składają się: serwery danych oraz serwer pośredniczący. Do serwerów danych należą: 
+
+\begin{itemize}
+\item serwer dostępu (account server) – służy do zarządzania kontami dostępu do kontenerów i obiektów Swifta, na potrzeby poniższej konfiguracji zostanie stworzony jeden użytkownik – administrator
+\item serwer kontenerów (container server) – służy do zarządzania kontenerami; kontenery przechowują obiekty
+\item serwer obiektów (object server) – służy do zarządzania obiektami
+\end{itemize}
+
+Konta dostępu, kontenery i obiekty to byty przezroczyste względem siebie oraz dla użytkowników. Użytkownik ma do nich dostęp przez API Swifta oraz z konsoli za pomocą polecenia st (więcej w podrozdziale Testowanie).
+
+Poniżej opisana konfiguracja dotyczy instalacji Swifta na kilku komputerach w laboratorium 518. Przy kolejnych próbach instalacji należy rozważyć skorzystanie ze świeżo wydanego zintegrowanego narzędzia instalacyjnego (OpenStack Deployment Tool). Więcej informacji o tym rozwiązaniu, jak i również linki do stron z jego opisem, można znaleźć w rozdziale Podsumowanie.
+
+\section{Architektura}
+Swift w wersji wielokomputerowej działa dla minimum jednego serwera pośredniczącego (Proxy) i trzech serwerów danych. Zaleca się uruchomienie co najmniej 5 serwerów danych. Jeden z nich może działać na tym samym komputerze co serwer Proxy.
+
+Konfiguracja oparta jest na koncepcji pierścienia. Zbiór wszystkich urządzeń podzielony jest na strefy (zone). Stefa odpowiada odizolowanej grupie urządzeń (np. serwerowni). Każda replika danych przechowywana jest w odrębnej strefie. 
+
+Zaleca się korzystanie z co najmniej 5 stref, dlatego w przypadku minimalistycznej konfiguracji w laboratorium, strefa odpowiadać będzie jednemu komputerowi. 
+
+Serwer pośredniczący odpowiedzialny jest za rozsyłanie danych. Dodatkowo dokonuje on uwierzytelnienia (Swauth) przy wykorzystaniu protokołu HTTP z SSL. 
+Do synchronizacji wykorzystywany jest protokół rsync.
+
+Każdy z serwerów danych zawiera serwer dostępu (account server), serwer kontenerów (container server) oraz serwer obiektów (object server).
+
+\section{Konfiguracja wstępna}
+Wszystkie poniższe polecenia należy wykonywać na każdym z komputerów z prawami administratora.
+
+\begin{verbatim}
+apt-get install python-software-properties
+apt-get update
+apt-get install swift openssh-server 
+\end{verbatim}
+
+Następnie należy utworzyć użytkownika swift (w pliku /etc/passwd), grupę swift (w pliku /etc/groups) oraz katalog /etc/swift. Właścicielem katalogu ma być użytkownik swift:
+
+\begin{verbatim}
+mkdir -p /etc/swift
+chown -R swift:swift /etc/swift/
+\end{verbatim}
+
+Na pierwszej ze stacji należy utworzyć plik /etc/swift/swift.conf o następującej zawartości:
+
+\begin{verbatim}
+[swift-hash]
+swift_hash_path_suffix = `od -t x8 -N 8 -A n </dev/random`
+\end{verbatim}
+
+Plik ten należy skopiować na inne stacje:
+
+\begin{verbatim}
+scp <NAZWA_UZYTKOWNIKA>@<NAZWA_STACJI>:/etc/swift/swift.conf /etc/swift/
+\end{verbatim}
+
+\section{Konfiguracja serwera pośredniczącego}
+
+Poniższa konfiguracja dotyczy jednego komputera, wybranego na serwer pośredniczący.
+
+Instalacja memcached (system buforowania pamięci podręcznej):
+
+\begin{verbatim}
+apt-get install swift-proxy memcached
+\end{verbatim}
+
+Utworzenie certyfikatu dla SSL:
+
+\begin{verbatim}
+cd /etc/swift
+openssl req -new -x509 -nodes -out cert.crt -keyout cert.key
+\end{verbatim}
+
+Zamiana wystąpienia adresu loopback w pliku konfiguracyjnym /etc/memcached.conf na adres IP konfigurowanej stacji:
+
+\begin{verbatim}
+perl -pi -e "s/-l 127.0.0.1/-l <ADRES_IP_STACJI_ROBOCZEJ>/" /etc/memcached.conf
+\end{verbatim}
+
+Restart usługi:
+
+\begin{verbatim}
+service memcached restart
+\end{verbatim}
+
+Utworzenie pliku konfiguracyjnego /etc/swift/proxy-server.conf:
+
+\begin{verbatim}
+[DEFAULT]
+cert_file = /etc/swift/cert.crt
+key_file = /etc/swift/cert.key
+bind_port = 8080
+workers = 8
+user = swift
+
+[pipeline:main]
+pipeline = healthcheck cache swauth proxy-server
+
+[app:proxy-server]
+use = egg:swift#proxy
+allow_account_management = true
+
+[filter:swauth]
+use = egg:swift#swauth
+default_swift_cluster = local#https://<ADRES_IP_STACJI_ROBOCZEJ>:8080/v1
+
+super_admin_key = <HASŁO_ADMINISTRATORA>
+
+[filter:healthcheck]
+use = egg:swift#healthcheck
+
+[filter:cache]
+use = egg:swift#memcache
+memcache_servers = <ADRES_IP_STACJI_ROBOCZEJ>:11211
+\end{verbatim}
+
+\section{Konfiguracja pierścienia}
+
+\begin{verbatim}
+cd /etc/swift
+swift-ring-builder account.builder create 18 5 1
+swift-ring-builder container.builder create 18 5 1
+swift-ring-builder object.builder create 18 5 1
+\end{verbatim}
+
+Parametrami przy tworzeniu pierścienia są kolejno: rząd wielkości pierścienia (typowo 18), liczba stref (w przypadku większej liczby stref należy zamiast 5 wpisać ich liczbę) i czas regeneracji (typowo 1).
+
+Poniższą konfigurację należy powtórzyć dla każdej stacji z serwerem danych (5 razy):
+
+\begin{verbatim}
+swift-ring-builder account.builder add z<NR_STREFY>-<IP_STACJI_ROBOCZEJ>:
+6002/<NAZWA_URZĄDZENIA> <WAGA>
+swift-ring-builder container.builder add z<NR_STREFY>-<IP_STACJI_ROBOCZEJ>:
+6001/<NAZWA_URZĄDZENIA> <WAGA>
+swift-ring-builder object.builder add z<NR_STREFY>-<IP_STACJI_ROBOCZEJ>:
+6000/<NAZWA_URZĄDZENIA> <WAGA>
+\end{verbatim}
+
+\begin{itemize}
+\item IP\_STACJI\_ROBOCZEJ – adres IP komputera z serwerem danych
+\item NR\_STREFY – kolejno od 1 do 5
+\item WAGA – współczynnik nadawany w celu rekompensacji zróżnicowania szybkości dysków (w przypadku laboratorium usprzętowienie jest identyczne dla każdego z komputerów, dlatego wagi powinny być identyczne i wynosić 100)
+\item NAZWA URZĄDZENIA – chodzi o urządzenie, pod którym będzie podmontowana baza danych Swifta, np. sdb1 (domyślnie w dalszej części dokumentu)
+\end{itemize}
+
+Weryfikacja:
+\begin{verbatim}
+swift-ring-builder account.builder
+swift-ring-builder container.builder
+swift-ring-builder object.builder
+\end{verbatim}
+
+Zrównoważenie pierścienia:
+\begin{verbatim}
+swift-ring-builder account.builder rebalance
+swift-ring-builder container.builder rebalance
+swift-ring-builder object.builder rebalance
+\end{verbatim}
+
+\section{Konfiguracja uwierzytelniania (Swauth)}
+
+Poniższa konfiguracja dotyczy jednego komputera, na którym wcześniej zainstalowano serwer pośredniczący.
+
+\subsection{Utworzenie konta administratora}
+
+\begin{verbatim}
+swauth-prep -A https://<ADRES_IP>:8080/auth/ -K <HASŁO_ADMINISTRATORA>
+
+swauth-add-user -A https://<ADRES_IP>:8080/auth/ -K <HASŁO_ADMINISTRATORA> 
+-a system root <HASŁO_ADMINISTRATORA_SWIFTA>
+\end{verbatim}
+
+\begin{itemize}
+\item HASŁO\_ADMINISTRATORA – musi zgadzać się z hasłem wpisanym w pliku proxy-server.conf
+\item HASŁO\_ADMINISTRATORA\_SWIFTA – będzie później używane do logowania do Swifta
+\item ADRES\_IP – adres IP komputera, na którym działa serwer pośredniczący
+\end{itemize}
+
+Uzyskanie X-Storage-Url i X-Auth-Token:
+
+\begin{verbatim}
+curl -k -v -H 'X-Storage-User: system:root' -H 'X-Storage-Pass: 
+<HASŁO_ADMINISTRATORA_SWIFTA>' https://<ADRES_IP>:8080/auth/v1.0
+\end{verbatim}
+
+\subsection{Testowanie}
+
+Testowanie dostępu:
+
+\begin{verbatim}
+curl -k -v -H 'X-Auth-Token: <TOKEN_FROM_X_AUTH_TOKEN_ABOVE>' 
+<URL_FROM_X_STORAGE_URL_ABOVE>
+\end{verbatim}
+
+Testowanie działania programu st, za pomocą którego odbywa się komunikacja z chmurą Swifta:
+	
+\begin{verbatim}
+st -A https://<ADRES_IP>:8080/auth/v1.0 -U system:root -K 
+<HASŁO_ADMINISTRATORA_SWIFTA> <POLECENIE>
+\end{verbatim}
+
+Przykłady poleceń:
+
+\begin{itemize}
+\item upload <NAZWA\_KONTENERA> <NAZWA\_PLIKU> - umieszczenie pliku w kontenerze
+\item download <NAZWA\_KONTENERA> <NAZWA\_PLIKU> - pobranie pliku z kontenera
+\item download <NAZWA\_KONTENERA> - pobranie całego kontenera
+\item list – wylistowanie kontenerów
+\item list <NAZWA\_KONTENERA> - wylistowanie zawartości kontenera
+\end{itemize}
+	
+\section{Konfiguracja serwerów danych}
+
+Konfiguracja opisana w tym rozdziale dotyczy każdego z serwerów danych. Na starcie należy pamiętać o wykonaniu kroków, które zostały opisane w punkcie 2.
+
+\subsection{Konfiguracja wstępna}
+
+Instalacja pakietów: 
+
+\begin{verbatim}
+apt-get install swift-account swift-container swift-object xfsprogs
+\end{verbatim}
+
+Utworzenie dysku wirtualnego: 
+
+\begin{verbatim}
+mkdir /srv
+dd if=/dev/zero of=/srv/swift-disk bs=1024 count=0 seek=1000000
+mkfs.xfs -i size=1024 /srv/swift-disk
+\end{verbatim}
+
+W pliku /etc/fstab należy dodać na końcu:
+
+\begin{verbatim}
+/srv/swift-disk /mnt/sdb1 xfs loop,noatime,nodiratime,nobarrier,logbufs=8 0 0
+\end{verbatim}
+
+Zamontowanie dysku wirtualnego i ustawienie uprawnień: 
+
+\begin{verbatim}
+mkdir -p /srv/node/sdb1
+mount /srv/node/sdb1
+chown -R swift:swift /srv/node
+\end{verbatim}
+
+\subsection{Konfiguracja protokołu rsync}
+
+Utworzenie pliku konfiguracyjnego dla rsync (/etc/rsyncd.conf):
+
+\begin{verbatim}
+uid = swift
+gid = swift
+log file = /var/log/rsyncd.log
+pid file = /var/run/rsyncd.pid
+address = 0.0.0.0
+
+[account]
+max connections = 2
+path = /srv/node/
+read only = false
+lock file = /var/lock/account.lock
+
+[container]
+max connections = 2
+path = /srv/node/
+read only = false
+lock file = /var/lock/container.lock
+
+[object]
+max connections = 2
+path = /srv/node/
+read only = false
+lock file = /var/lock/object.lock
+\end{verbatim}
+
+Włączenie protokołu rsync: 
+
+\begin{verbatim}
+perl -pi -e 's/RSYNC_ENABLE=false/RSYNC_ENABLE=true/' /etc/default/rsync
+service rsync start
+\end{verbatim}
+
+\subsection{Utworzenie plików konfiguracyjnych serwerów danych}
+
+Plik /etc/swift/account-server.conf: 
+
+\begin{verbatim}
+[DEFAULT]
+bind_ip = 0.0.0.0
+workers = 2
+
+[pipeline:main]
+pipeline = account-server
+
+[app:account-server]
+use = egg:swift#account
+
+[account-replicator]
+
+[account-auditor]
+
+[account-reaper]
+\end{verbatim}
+
+Plik /etc/swift/container-server.conf: 
+
+\begin{verbatim}
+[DEFAULT]
+bind_ip = 0.0.0.0
+workers = 2
+
+[pipeline:main]
+pipeline = container-server
+
+[app:container-server]
+use = egg:swift#container
+
+[container-replicator]
+
+[container-updater]
+
+[container-auditor]
+\end{verbatim}
+
+Plik /etc/swift/object-server.conf: 
+
+\begin{verbatim}
+[DEFAULT]
+bind_ip = 0.0.0.0
+workers = 2
+
+[pipeline:main]
+pipeline = object-server
+
+[app:object-server]
+use = egg:swift#object
+
+[object-replicator]
+
+[object-updater]
+
+[object-auditor]
+\end{verbatim}
+
+\section{Uruchamianie serwera pośredniczącego oraz serwerów danych}
+
+Należy skopiować pliki account.ring.gz, container.ring.gz i object.ring.gz wygenerowane przez swift-ring-builder na komputerze, na którym wcześniej skonfigurowano serwer pośredniczący, na pozostałe stacje robocze do katalogu /etc/swift.
+
+Przed uruchomieniem wszystkich serwerów, na każdym komputerze należy upewnić się, że użytkownik swift jest właścicielem katalogu /etc/swift:
+
+\begin{verbatim}
+chown -R swift:swift /etc/swift
+\end{verbatim}
+
+Poniższe polecenie służy do wystartowania wszystkich usług Swifta (zarówno serwera pośredniczącego, jak i wszystkich serwerów danych). Polecenie to należy wykonać na każdym komputerze z osobna:
+
+\begin{verbatim}
+swift-init all start
+\end{verbatim}
+	
+Restart usług:
+	
+\begin{verbatim}
+swift-init all restart
+\end{verbatim}
+
+\section{Podsumowanie}
+\subsection{Odporność na awarie}
+
+Testowanie aplikacji korzystającej z kontenerów Swifta wykazało słabą odporność na awarie. Wbrew oczekiwaniom, po odłączeniu jednego z komputerów od sieci, system nie był w stanie się zregenerować. Dopiero ponowne podłączenie kabla pozwalało na poprawne wykonanie operacji na kontenerach i obiektach.
+
+Tak więc w warunkach laboratoryjnych, jedynym sposobem na zmianę konfiguracji pierścienia jest modyfikacja ustawień swift-ring-buildera.
+
+Aby uzyskać pewną jasność co do reakcji swiftowego pierścienia na awarie, należałoby przetestować go w warunkach docelowych, a więc dla znacznie większej liczby serwerów danych i serwerów pośredniczących, co w warunkach akademickich jest nie do zrealizowania.
+
+\subsection{Integracja z Novą i Glance}
+
+W czerwcu 2011 światło dzienne ujrzało oficjalne narzędzie do zintegrowanej instalacji OpenStacka – OpenStack Deployment Tool. Wcześniej narzędzie to umożliwiało jedynie usprawnienie instalacji Novy.
+
+Instalacja OpenStacka sprowadza się do uruchomienia jednego skryptu napisanego w Pythonie i edycji pliku konfiguracyjnego. Wcześniej należy jedynie pobrać repozytoria OpenStacka, wygenerować klucze do komunikacji SSH bez użycia haseł oraz utworzyć dyski wirtualne.
+
+W pliku konfiguracyjnym można wpisać, które komputery będą świadczyły poszczególne usługi. 
+
+Pełny opis instalacji znajduje się na stronach:
+
+\begin{itemize}
+\item http://wiki.openstack.org/NovaInstall/NovaDeploymentTool\#Current\_
+Release\_Status\_and\_Future\_Plans
+\item http://docs.openstack.org/cactus/openstack-compute/admin/content/openstack-compute-deployment-tool-with-puppet.html
+\end{itemize}
+
+Dostępna jest również instalacja Swifta przy użyciu VirtualBox’a oraz programów Vagrant i Chef.
+
+\begin{itemize}
+\item http://docs.openstack.org/cactus/openstack-compute/admin/content/openstack-compute-installation-using-virtualbox-vagrant-and-chef.html
+\end{itemize}
+
+\end{document}
